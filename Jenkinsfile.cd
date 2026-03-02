@@ -1,0 +1,162 @@
+pipeline {
+    agent { label 'ec2-agent' }
+
+    environment {
+        // Repo / rama para CD
+        REPO_URL = 'https://github.com/dobifree/todo-list-aws'
+        MAIN_BRANCH = 'master'
+        PYTHONPATH = "${WORKSPACE}"
+
+        // AWS / SAM
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SAM_CLI_TELEMETRY = '0'
+
+        // Debe coincidir con [production.deploy.parameters].stack_name en samconfig.toml
+        STACK_NAME = 'todo-list-aws-production'
+
+        // Output del stack con la URL de la API
+        API_URL_OUTPUT_KEY = 'BaseUrlApi'
+    }
+
+    stages {
+
+        stage('Get Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${MAIN_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                sh '''
+set -e
+echo "=== Workspace ==="
+pwd
+ls -la
+echo "=== Host/Agent ==="
+hostname
+whoami
+'''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+set -e
+mkdir -p reports
+
+echo "=== SAM version ==="
+sam --version
+
+echo "=== SAM Build ==="
+sam build --region "$AWS_REGION"
+
+echo "=== SAM Validate ==="
+sam validate --region "$AWS_REGION"
+
+echo "=== SAM Deploy (production, no interactivo) ==="
+sam deploy \
+  --config-env production \
+  --region "$AWS_REGION" \
+  --no-confirm-changeset \
+  --no-fail-on-empty-changeset
+
+echo "=== Obtener outputs del stack con SAM ==="
+sam list stack-outputs \
+  --stack-name "$STACK_NAME" \
+  --region "$AWS_REGION" \
+  --output json > reports/stack_outputs.json
+
+python3 - <<'PY'
+import json, sys
+
+path = "reports/stack_outputs.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+items = data
+if isinstance(data, dict):
+    items = data.get("StackOutputs", data.get("outputs", []))
+
+if not isinstance(items, list):
+    print("ERROR: Formato inesperado en stack outputs:", type(items))
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+target_key = "BaseUrlApi"
+value = None
+for item in items:
+    if isinstance(item, dict) and item.get("OutputKey") == target_key:
+        value = item.get("OutputValue")
+        break
+
+if not value:
+    print(f"ERROR: No se encontró output '{target_key}' en {path}")
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+with open("reports/base_url.txt", "w", encoding="utf-8") as f:
+    f.write(value)
+
+print("BASE_URL =", value)
+PY
+
+test -s reports/base_url.txt
+'''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/base_url.txt,reports/stack_outputs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Rest Test') {
+            steps {
+                sh '''
+set -e
+mkdir -p reports
+
+BASE_URL=$(cat reports/base_url.txt)
+echo "Usando BASE_URL=$BASE_URL"
+
+# Prueba de solo lectura (producción): GET /todos
+CODE=$(curl -s -o reports/get_all_production.json -w "%{http_code}" "$BASE_URL/todos")
+echo "GET /todos => $CODE"
+
+echo "=== Body GET /todos ==="
+cat reports/get_all_production.json || true
+
+# Validar código esperado
+test "$CODE" = "200"
+
+# Validar que el body sea JSON válido (opcional, pero recomendado)
+python3 - <<'PY'
+import json
+with open("reports/get_all_production.json", "r", encoding="utf-8") as f:
+    json.load(f)
+print("JSON válido")
+PY
+
+echo "=== Rest Test CD (read-only) OK ==="
+'''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/get_all_production.json', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Reto 2 CD OK (master -> production + prueba read-only con curl)'
+        }
+        failure {
+            echo 'Revisar Console Output'
+        }
+    }
+}

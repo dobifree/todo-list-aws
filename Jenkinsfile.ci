@@ -1,0 +1,251 @@
+pipeline {
+    agent any
+
+    environment {
+        // Repo / ramas
+        REPO_URL = 'https://github.com/dobifree/todo-list-aws'
+        DEV_BRANCH = 'develop'
+        MAIN_BRANCH = 'master'
+        PYTHONPATH = "${WORKSPACE}"
+
+        // Región AWS para SAM
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SAM_CLI_TELEMETRY = '0'
+
+        // Debe coincidir con [staging.deploy.parameters].stack_name en samconfig.toml
+        STACK_NAME = 'todo-list-aws-staging'
+
+        // Output del stack con la URL de la API
+        API_URL_OUTPUT_KEY = 'BaseUrlApi'
+
+        // Promote (merge develop -> master)
+        ENABLE_PROMOTE = 'true'
+        GIT_CREDENTIALS_ID = 'github-pat'
+    }
+
+    stages {
+
+        stage('Get Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${DEV_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                sh '''
+                    echo "=== Workspace ==="
+                    pwd
+                    ls -la
+                    echo "=== Host/Agent ==="
+                    hostname
+                    whoami
+                '''
+            }
+        }
+
+        stage('Static Test') {
+            steps {
+                sh '''
+                    set -e
+
+                    # Ubuntu 24.04 / Python 3.12 -> usar venv (PEP 668)
+                    rm -rf venv
+                    python3 -m venv venv
+                    . venv/bin/activate
+
+                    python3 --version
+                    mkdir -p reports
+
+                    # La guía pide validar SOLO /src
+                    test -d src
+
+                    pip install --upgrade pip
+                    pip install flake8 bandit
+
+                    # Flake8: generar reporte y NO fallar por hallazgos
+                    flake8 src --exit-zero --output-file=reports/flake8.out || true
+
+                    # Bandit: salida parseable por Warnings NG (parser pyLint)
+                    bandit --exit-zero -r src \
+                      -f custom -o reports/bandit.out \
+                      --msg-template "{relpath}:{line}: [BANDIT] {test_id} {msg}" || true
+
+                    echo "=== Preview Flake8 ==="
+                    head -20 reports/flake8.out || true
+
+                    echo "=== Preview Bandit ==="
+                    head -20 reports/bandit.out || true
+                '''
+            }
+            post {
+                always {
+                    recordIssues(
+                        enabledForFailure: true,
+                        tools: [flake8(pattern: 'reports/flake8.out')]
+                    )
+
+                    recordIssues(
+                        enabledForFailure: true,
+                        tools: [pyLint(name: 'Bandit', pattern: 'reports/bandit.out')]
+                    )
+
+                    archiveArtifacts artifacts: 'reports/*.out', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== SAM version ==="
+                    sam --version
+
+                    echo "=== SAM Build ==="
+                    sam build --region "$AWS_REGION"
+
+                    echo "=== SAM Validate ==="
+                    sam validate --region "$AWS_REGION"
+
+                    echo "=== SAM Deploy (staging, no interactivo) ==="
+                    sam deploy \
+                      --config-env staging \
+                      --region "$AWS_REGION" \
+                      --no-confirm-changeset \
+                      --no-fail-on-empty-changeset
+
+                    echo "=== Obtener outputs del stack con SAM ==="
+                    sam list stack-outputs \
+                      --stack-name "$STACK_NAME" \
+                      --region "$AWS_REGION" \
+                      --output json > reports/stack_outputs.json
+
+                    python3 - <<'PY'
+import json, sys
+
+path = "reports/stack_outputs.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# Soporta distintos formatos posibles según versión de SAM
+items = data
+if isinstance(data, dict):
+    items = data.get("StackOutputs", data.get("outputs", []))
+
+if not isinstance(items, list):
+    print("ERROR: Formato inesperado en stack outputs:", type(items))
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+target_key = "BaseUrlApi"
+value = None
+for item in items:
+    if isinstance(item, dict) and item.get("OutputKey") == target_key:
+        value = item.get("OutputValue")
+        break
+
+if not value:
+    print(f"ERROR: No se encontró output '{target_key}' en {path}")
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+with open("reports/base_url.txt", "w", encoding="utf-8") as f:
+    f.write(value)
+
+print("BASE_URL =", value)
+PY
+
+                    test -s reports/base_url.txt
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/base_url.txt,reports/stack_outputs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Rest Test') {
+            steps {
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    BASE_URL=$(cat reports/base_url.txt)
+                    echo "Usando BASE_URL=$BASE_URL"
+
+                    # Recrear venv para este stage (shell limpia por stage)
+                    rm -rf venv
+                    python3 -m venv venv
+                    . venv/bin/activate
+
+                    pip install --upgrade pip
+                    pip install pytest requests
+
+                    # Exportar URL para los tests
+                    export API_URL="$BASE_URL"
+
+                    # Ejecutar pruebas de integración
+                    pytest -v test/integration/todoApiTest.py \
+                      --junitxml=reports/rest-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'reports/rest-tests.xml', allowEmptyResults: true
+                    archiveArtifacts artifacts: 'reports/rest-tests.xml,reports/*.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Promote') {
+            when {
+                expression { env.ENABLE_PROMOTE == 'true' }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${GIT_CREDENTIALS_ID}",
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_TOKEN'
+                )]) {
+                    sh '''
+                        set -e
+
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@local"
+
+                        git fetch origin
+
+                        git checkout -B "$DEV_BRANCH" "origin/$DEV_BRANCH"
+                        git checkout -B "$MAIN_BRANCH" "origin/$MAIN_BRANCH"
+
+                        # Merge develop -> master
+                        git merge --no-ff --no-edit "$DEV_BRANCH"
+
+                        # Push autenticado a GitHub
+                        git remote set-url origin "https://${GIT_USER}:${GIT_TOKEN}@github.com/dobifree/todo-list-aws.git"
+                        git push origin "$MAIN_BRANCH"
+
+                        echo "Promote OK: ${DEV_BRANCH} -> ${MAIN_BRANCH}"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Reto 1 CI OK (ejecutado en agente)'
+        }
+        unstable {
+            echo 'Build inestable (puede ser normal por warnings de Static Test)'
+        }
+        failure {
+            echo 'Revisar Console Output'
+        }
+    }
+}

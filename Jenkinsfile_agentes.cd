@@ -1,0 +1,182 @@
+pipeline {
+    agent none
+
+    environment {
+        // Repo / rama para CD
+        REPO_URL = 'https://github.com/dobifree/todo-list-aws'
+        MAIN_BRANCH = 'master'
+        PYTHONPATH = "${WORKSPACE}"
+
+        // AWS / SAM
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SAM_CLI_TELEMETRY = '0'
+
+        // Producción
+        STACK_NAME = 'todo-list-aws-production'
+        API_URL_OUTPUT_KEY = 'BaseUrlApi'
+    }
+
+    stages {
+
+        stage('Get Code') {
+            agent { label 'principal' }
+            steps {
+                deleteDir()
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${MAIN_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                sh '''
+                    set -e
+                    echo "=== Get Code CD (principal) ==="
+                    hostname
+                    whoami
+                    pwd
+                    git rev-parse --short HEAD
+                    ls -la
+                '''
+
+                stash name: 'source-code-cd', includes: '**/*', excludes: '.git/**'
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'principal' } // por simplificación del reto
+            steps {
+                deleteDir()
+                unstash 'source-code-cd'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Deploy CD (principal / production) ==="
+                    hostname
+                    whoami
+
+                    echo "=== SAM version ==="
+                    sam --version
+
+                    echo "=== SAM Build ==="
+                    sam build --region "$AWS_REGION"
+
+                    echo "=== SAM Validate ==="
+                    sam validate --region "$AWS_REGION"
+
+                    echo "=== SAM Deploy (production, no interactivo) ==="
+                    sam deploy \
+                      --config-env production \
+                      --region "$AWS_REGION" \
+                      --no-confirm-changeset \
+                      --no-fail-on-empty-changeset
+
+                    echo "=== Obtener outputs del stack con SAM ==="
+                    sam list stack-outputs \
+                      --stack-name "$STACK_NAME" \
+                      --region "$AWS_REGION" \
+                      --output json > reports/stack_outputs.json
+
+                    python3 - <<'PY'
+import json, sys
+
+path = "reports/stack_outputs.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+items = data
+if isinstance(data, dict):
+    items = data.get("StackOutputs", data.get("outputs", []))
+
+if not isinstance(items, list):
+    print("ERROR: Formato inesperado en stack outputs:", type(items))
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+target_key = "BaseUrlApi"
+value = None
+for item in items:
+    if isinstance(item, dict) and item.get("OutputKey") == target_key:
+        value = item.get("OutputValue")
+        break
+
+if not value:
+    print(f"ERROR: No se encontró output '{target_key}' en {path}")
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+with open("reports/base_url.txt", "w", encoding="utf-8") as f:
+    f.write(value)
+
+print("BASE_URL =", value)
+PY
+
+                    test -s reports/base_url.txt
+                '''
+
+                // Solución al problema de la URL entre agentes
+                stash name: 'deploy-outputs-cd', includes: 'reports/base_url.txt,reports/stack_outputs.json'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/base_url.txt,reports/stack_outputs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Rest Test') {
+            agent { label 'ec2-agent-rest' } // agente REST read-only
+            steps {
+                deleteDir()
+                unstash 'deploy-outputs-cd'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Rest Test CD (ec2-agent-rest, read-only) ==="
+                    hostname
+                    whoami
+
+                    BASE_URL=$(cat reports/base_url.txt)
+                    echo "Usando BASE_URL=$BASE_URL"
+
+                    # Prueba de solo lectura en producción
+                    CODE=$(curl -s -o reports/get_all_production.json -w "%{http_code}" "$BASE_URL/todos")
+                    echo "GET /todos => $CODE"
+
+                    echo "=== Body GET /todos ==="
+                    cat reports/get_all_production.json || true
+
+                    test "$CODE" = "200"
+
+                    # Validar JSON
+                    python3 - <<'PY'
+import json
+with open("reports/get_all_production.json", "r", encoding="utf-8") as f:
+    json.load(f)
+print("JSON válido")
+PY
+
+                    echo "=== Rest Test CD OK ==="
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/get_all_production.json', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Reto 3 CD OK (distribución en agentes)'
+        }
+        failure {
+            echo 'Revisar Console Output'
+        }
+    }
+}
