@@ -1,0 +1,291 @@
+pipeline {
+    agent none
+
+    environment {
+        // Repo app
+        REPO_URL = 'https://github.com/dobifree/todo-list-aws'
+        DEV_BRANCH = 'develop'
+        MAIN_BRANCH = 'master'
+
+        // Repo config (Reto 4)
+        CONFIG_REPO_URL = 'https://github.com/dobifree/todo-list-aws-config'
+        CONFIG_BRANCH = 'staging'   // CI usa config de staging
+
+        PYTHONPATH = "${WORKSPACE}"
+
+        // AWS / SAM
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SAM_CLI_TELEMETRY = '0'
+
+        // CI / staging
+        STACK_NAME = 'todo-list-aws-staging'
+        API_URL_OUTPUT_KEY = 'BaseUrlApi'
+
+        // Promote
+        ENABLE_PROMOTE = 'true'
+        GIT_CREDENTIALS_ID = 'github-pat'
+    }
+
+    stages {
+
+        stage('Get Code') {
+            agent { label 'principal' }
+            steps {
+                deleteDir()
+
+                // 1) Repo de aplicación (develop)
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${DEV_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                // 2) Repo de configuración (rama staging) y copiar samconfig.toml al workspace
+                sh '''
+                    set -e
+
+                    echo "=== Get Code APP (principal) ==="
+                    hostname
+                    whoami
+                    git rev-parse --short HEAD
+
+                    echo "=== Descargando config repo (${CONFIG_BRANCH}) ==="
+                    rm -rf _configrepo
+                    git clone --depth 1 --branch "$CONFIG_BRANCH" "$CONFIG_REPO_URL" _configrepo
+
+                    test -f _configrepo/samconfig.toml
+                    cp _configrepo/samconfig.toml ./samconfig.toml
+                    rm -rf _configrepo
+
+                    echo "=== samconfig.toml descargado (CI/staging) ==="
+                    ls -la samconfig.toml
+                    head -40 samconfig.toml || true
+                    grep -n "\\[staging\\]" samconfig.toml || true
+                '''
+
+                // Código + samconfig.toml para otros agentes
+                stash name: 'source-code-ci', includes: '**/*', excludes: '.git/**'
+            }
+        }
+
+        stage('Static Test') {
+            agent { label 'ec2-agent-ubuntu' } // agente análisis estático
+            steps {
+                deleteDir()
+                unstash 'source-code-ci'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Static Test (ec2-agent-ubuntu) ==="
+                    hostname
+                    whoami
+
+                    rm -rf venv
+                    python3 -m venv venv
+                    . venv/bin/activate
+
+                    python3 --version
+                    test -d src
+
+                    pip install --upgrade pip
+                    pip install flake8 bandit
+
+                    flake8 src --exit-zero --output-file=reports/flake8.out || true
+
+                    bandit --exit-zero -r src \
+                      -f custom -o reports/bandit.out \
+                      --msg-template "{relpath}:{line}: [BANDIT] {test_id} {msg}" || true
+
+                    head -20 reports/flake8.out || true
+                    head -20 reports/bandit.out || true
+                '''
+            }
+            post {
+                always {
+                    recordIssues(
+                        enabledForFailure: true,
+                        tools: [flake8(pattern: 'reports/flake8.out')]
+                    )
+                    recordIssues(
+                        enabledForFailure: true,
+                        tools: [pyLint(name: 'Bandit', pattern: 'reports/bandit.out')]
+                    )
+                    archiveArtifacts artifacts: 'reports/*.out', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'principal' } // permitido por el enunciado
+            steps {
+                deleteDir()
+                unstash 'source-code-ci'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Deploy CI (principal / staging) ==="
+                    hostname
+                    whoami
+                    ls -la samconfig.toml
+                    grep -n "\\[staging\\]" samconfig.toml || true
+
+                    sam --version
+                    sam build --region "$AWS_REGION"
+                    sam validate --region "$AWS_REGION"
+
+                    # Usa samconfig.toml descargado desde repo config (rama staging)
+                    sam deploy \
+                      --config-env staging \
+                      --region "$AWS_REGION" \
+                      --no-confirm-changeset \
+                      --no-fail-on-empty-changeset
+
+                    sam list stack-outputs \
+                      --stack-name "$STACK_NAME" \
+                      --region "$AWS_REGION" \
+                      --output json > reports/stack_outputs.json
+
+                    python3 - <<'PY'
+import json, sys
+path = "reports/stack_outputs.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+items = data
+if isinstance(data, dict):
+    items = data.get("StackOutputs", data.get("outputs", []))
+
+if not isinstance(items, list):
+    print("ERROR: Formato inesperado en stack outputs:", type(items))
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+value = None
+for item in items:
+    if isinstance(item, dict) and item.get("OutputKey") == "BaseUrlApi":
+        value = item.get("OutputValue")
+        break
+
+if not value:
+    print("ERROR: No se encontró BaseUrlApi")
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+with open("reports/base_url.txt", "w", encoding="utf-8") as f:
+    f.write(value)
+
+print("BASE_URL =", value)
+PY
+
+                    test -s reports/base_url.txt
+                '''
+
+                // Pasar URL al agente REST
+                stash name: 'deploy-outputs-ci', includes: 'reports/base_url.txt,reports/stack_outputs.json'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/base_url.txt,reports/stack_outputs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Rest Test') {
+            agent { label 'ec2-agent-rest' }
+            steps {
+                deleteDir()
+                unstash 'source-code-ci'
+                unstash 'deploy-outputs-ci'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Rest Test CI (ec2-agent-rest) ==="
+                    hostname
+                    whoami
+
+                    BASE_URL=$(cat reports/base_url.txt)
+                    echo "Usando BASE_URL=$BASE_URL"
+
+                    rm -rf venv
+                    python3 -m venv venv
+                    . venv/bin/activate
+
+                    pip install --upgrade pip
+                    pip install pytest requests
+
+                    export API_URL="$BASE_URL"
+
+                    pytest -v test/integration/todoApiTest.py \
+                      --junitxml=reports/rest-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'reports/rest-tests.xml', allowEmptyResults: true
+                    archiveArtifacts artifacts: 'reports/rest-tests.xml', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Promote') {
+            agent { label 'principal' }
+            when {
+                expression { env.ENABLE_PROMOTE == 'true' }
+            }
+            steps {
+                deleteDir()
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${DEV_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                withCredentials([usernamePassword(
+                    credentialsId: "${GIT_CREDENTIALS_ID}",
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_TOKEN'
+                )]) {
+                    sh '''
+                        set -e
+                        echo "=== Promote (principal) ==="
+                        hostname
+                        whoami
+
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@local"
+
+                        git fetch origin
+                        git checkout -B "$DEV_BRANCH" "origin/$DEV_BRANCH"
+                        git checkout -B "$MAIN_BRANCH" "origin/$MAIN_BRANCH"
+
+                        git merge --no-ff --no-edit "$DEV_BRANCH"
+
+                        git remote set-url origin "https://${GIT_USER}:${GIT_TOKEN}@github.com/dobifree/todo-list-aws.git"
+                        git push origin "$MAIN_BRANCH"
+
+                        echo "Promote OK: ${DEV_BRANCH} -> ${MAIN_BRANCH}"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Reto 4 + Reto 3 (CI con config separada) OK'
+        }
+        unstable {
+            echo 'Build inestable (posible por warnings de análisis estático)'
+        }
+        failure {
+            echo 'Revisar Console Output'
+        }
+    }
+}

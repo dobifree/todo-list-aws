@@ -1,0 +1,197 @@
+pipeline {
+    agent none
+
+    environment {
+        // Repo app
+        REPO_URL = 'https://github.com/dobifree/todo-list-aws'
+        MAIN_BRANCH = 'master'
+
+        // Repo config (Reto 4)
+        CONFIG_REPO_URL = 'https://github.com/dobifree/todo-list-aws-config'
+        CONFIG_BRANCH = 'production'   // CD usa config de production
+
+        PYTHONPATH = "${WORKSPACE}"
+
+        // AWS / SAM
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SAM_CLI_TELEMETRY = '0'
+
+        // Producción
+        STACK_NAME = 'todo-list-aws-production'
+        API_URL_OUTPUT_KEY = 'BaseUrlApi'
+    }
+
+    stages {
+
+        stage('Get Code') {
+            agent { label 'principal' }
+            steps {
+                deleteDir()
+
+                // 1) Repo de aplicación (master)
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${MAIN_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}"]]
+                ])
+
+                // 2) Repo de configuración (rama production)
+                sh '''
+                    set -e
+
+                    echo "=== Get Code CD APP (principal) ==="
+                    hostname
+                    whoami
+                    git rev-parse --short HEAD
+
+                    echo "=== Descargando config repo (${CONFIG_BRANCH}) ==="
+                    rm -rf _configrepo
+                    git clone --depth 1 --branch "$CONFIG_BRANCH" "$CONFIG_REPO_URL" _configrepo
+
+                    test -f _configrepo/samconfig.toml
+                    cp _configrepo/samconfig.toml ./samconfig.toml
+                    rm -rf _configrepo
+
+                    echo "=== samconfig.toml descargado (CD/production) ==="
+                    ls -la samconfig.toml
+                    head -40 samconfig.toml || true
+                    grep -n "\\[production\\]" samconfig.toml || true
+                '''
+
+                stash name: 'source-code-cd', includes: '**/*', excludes: '.git/**'
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'principal' } // permitido por el enunciado
+            steps {
+                deleteDir()
+                unstash 'source-code-cd'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Deploy CD (principal / production) ==="
+                    hostname
+                    whoami
+                    ls -la samconfig.toml
+                    grep -n "\\[production\\]" samconfig.toml || true
+
+                    sam --version
+                    sam build --region "$AWS_REGION"
+                    sam validate --region "$AWS_REGION"
+
+                    # Usa samconfig.toml descargado desde repo config (rama production)
+                    sam deploy \
+                      --config-env production \
+                      --region "$AWS_REGION" \
+                      --no-confirm-changeset \
+                      --no-fail-on-empty-changeset
+
+                    sam list stack-outputs \
+                      --stack-name "$STACK_NAME" \
+                      --region "$AWS_REGION" \
+                      --output json > reports/stack_outputs.json
+
+                    python3 - <<'PY'
+import json, sys
+
+path = "reports/stack_outputs.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+items = data
+if isinstance(data, dict):
+    items = data.get("StackOutputs", data.get("outputs", []))
+
+if not isinstance(items, list):
+    print("ERROR: Formato inesperado en stack outputs:", type(items))
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+target_key = "BaseUrlApi"
+value = None
+for item in items:
+    if isinstance(item, dict) and item.get("OutputKey") == target_key:
+        value = item.get("OutputValue")
+        break
+
+if not value:
+    print(f"ERROR: No se encontró output '{target_key}' en {path}")
+    print(json.dumps(data, indent=2))
+    sys.exit(1)
+
+with open("reports/base_url.txt", "w", encoding="utf-8") as f:
+    f.write(value)
+
+print("BASE_URL =", value)
+PY
+
+                    test -s reports/base_url.txt
+                '''
+
+                // Pasar URL al agente REST
+                stash name: 'deploy-outputs-cd', includes: 'reports/base_url.txt,reports/stack_outputs.json'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/base_url.txt,reports/stack_outputs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Rest Test') {
+            agent { label 'ec2-agent-rest' } // read-only en agente REST
+            steps {
+                deleteDir()
+                unstash 'deploy-outputs-cd'
+
+                sh '''
+                    set -e
+                    mkdir -p reports
+
+                    echo "=== Rest Test CD (ec2-agent-rest, read-only) ==="
+                    hostname
+                    whoami
+
+                    BASE_URL=$(cat reports/base_url.txt)
+                    echo "Usando BASE_URL=$BASE_URL"
+
+                    # Prueba de solo lectura en producción
+                    CODE=$(curl -s -o reports/get_all_production.json -w "%{http_code}" "$BASE_URL/todos")
+                    echo "GET /todos => $CODE"
+
+                    echo "=== Body GET /todos ==="
+                    cat reports/get_all_production.json || true
+
+                    test "$CODE" = "200"
+
+                    python3 - <<'PY'
+import json
+with open("reports/get_all_production.json", "r", encoding="utf-8") as f:
+    json.load(f)
+print("JSON válido")
+PY
+
+                    echo "=== Rest Test CD OK ==="
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/get_all_production.json', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Reto 4 + Reto 3 (CD con config separada) OK'
+        }
+        failure {
+            echo 'Revisar Console Output'
+        }
+    }
+}
